@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+"""
+用法：
+  python mermaid_to_drawio.py input.mermaid output.drawio
+
+功能：
+  1. 讀取 Mermaid flowchart 定義 (flowchart TD/BT/LR/RL...)
+  2. 解析節點與連線
+  3. 產生 draw.io (mxGraph) 的 XML，可直接於 draw.io (app.diagrams.net) 匯入
+  4. 只做最基本的配置與簡易定位，需要在 draw.io 手動重新排版
+"""
+
+# 在 draw.io 中一般常見的 mxCell 樣式參考：
+#   - 矩形節點: shape=rectangle
+#   - 菱形(決策)節點: shape=rhombus
+#   # 也可自行微調其他樣式，例如圓角、顏色等
+
+NODE_PATTERN = re.compile(r'^([\w\d_]+)(\[[^\]]+\]|\{[^}]+\})')
+EDGE_PATTERN = re.compile(r'^([\w\d_]+)\s*-->(?:\|([^|]+)\|)?\s*([\w\d_]+)(.*)$')
+FLOWCHART_PATTERN = re.compile(r'^\s*flowchart\s+(\w\w?)', re.IGNORECASE)
+
+def parse_mermaid(file_path):
+    direction = "TD"  # 預設從上到下
+    nodes = {}        # id -> (label, shape)
+    edges = []        # (src, label, dst)
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("%") or line.startswith("%%"):
+            continue
+
+        # 1) 取得 flowchart 方向 (TD/BT/LR/RL)
+        m_flow = FLOWCHART_PATTERN.match(line)
+        if m_flow:
+            direction = m_flow.group(1).upper()
+            continue
+
+        # 2) 偵測定義單一節點 (如果行只有節點、無 ->)
+        m_node = NODE_PATTERN.match(line)
+        if m_node and '-->' not in line:
+            node_id = m_node.group(1)
+            raw_label = m_node.group(2)
+            label, shape = extract_label_and_shape(raw_label)
+            nodes[node_id] = (label, shape)
+            continue
+
+        # 3) 偵測邊 (edge)
+        m_edge = EDGE_PATTERN.match(line)
+        if m_edge:
+            src = m_edge.group(1)
+            elabel = m_edge.group(2) or ""  # edge label
+            dst = m_edge.group(3)
+            remainder = m_edge.group(4).strip()
+
+            # 若該行最後還包含節點定義(如 "A -->|xx| B[文字]")，需進一步解析
+            node_match = re.match(r'^(\[[^\]]+\]|\{[^}]+\})$', remainder)
+            if node_match:
+                raw_label = node_match.group(1)
+                # 若 B 尚未在 nodes 裡，則此時建立
+                if dst not in nodes:
+                    lbl, shp = extract_label_and_shape(raw_label)
+                    nodes[dst] = (lbl, shp)
+
+            # 確保 source/dest 都登記為節點
+            if src not in nodes:
+                # 若源端之前沒定義，先建一個簡易標籤
+                nodes[src] = (src, 'rectangle')
+            if dst not in nodes:
+                # 若目標之前沒定義
+                nodes[dst] = (dst, 'rectangle')
+
+            edges.append((src, elabel, dst))
+            continue
+
+    return direction, nodes, edges
+
+def extract_label_and_shape(raw_label):
+    # 根據 Mermaid 語法：
+    #   [文字] => 矩形
+    #   {文字} => 菱形(決策)
+    # 拆出中間文字，並選擇對應形狀
+    if raw_label.startswith('[') and raw_label.endswith(']'):
+        label = raw_label[1:-1].strip()
+        shape = 'rectangle'
+    elif raw_label.startswith('{') and raw_label.endswith('}'):
+        label = raw_label[1:-1].strip()
+        shape = 'rhombus'
+    else:
+        label = raw_label.strip()
+        shape = 'rectangle'
+    return label, shape
+
+def generate_drawio_xml(direction, nodes, edges):
+    """
+    產生一個可匯入 draw.io 的 XML 結構 (mxGraphModel)，以最簡單的方式做佈局。
+    direction 用不到詳細自動佈局，僅作為標示，可自行改寫擴充。
+    """
+
+    # 建立基本 XML 結構
+    mxfile = ET.Element('mxfile', attrib={
+        'host': 'app.diagrams.net',
+        'modified': '2023-01-01T00:00:00Z',
+        'agent': 'mermaid-to-drawio',
+        'version': '15.6.7',
+        'type': 'device'
+    })
+    diagram = ET.SubElement(mxfile, 'diagram', attrib={'id': 'mermaid', 'name': 'Page-1'})
+    mxGraphModel = ET.SubElement(diagram, 'mxGraphModel')
+    root = ET.SubElement(mxGraphModel, 'root')
+
+    # 基本層級
+    ET.SubElement(root, 'mxCell', attrib={'id': '0'})
+    layer0 = ET.SubElement(root, 'mxCell', attrib={'id': '1', 'parent': '0'})
+
+    # 簡易將所有節點排成一列或網格
+    idx = 0
+    spacing_x = 200
+    spacing_y = 120
+    for i, (node_id, (label, shape)) in enumerate(nodes.items()):
+        x = (i % 5) * spacing_x
+        y = (i // 5) * spacing_y
+
+        style = f"shape={shape};verticalAlign=middle;horizontalAlign=center;"
+
+        node_cell = ET.SubElement(root, 'mxCell', attrib={
+            'id': node_id,
+            'value': label,
+            'style': style,
+            'vertex': '1',
+            'parent': '1'
+        })
+        ET.SubElement(node_cell, 'mxGeometry', attrib={
+            'x': str(x),
+            'y': str(y),
+            'width': '120',
+            'height': '60'
+        }).set('as', 'geometry')
+
+    # 建立邊連線
+    for j, (src, elabel, dst) in enumerate(edges, start=1000):
+        edge_cell = ET.SubElement(root, 'mxCell', attrib={
+            'id': str(j),
+            'value': elabel,
+            'style': "edgeStyle=elbowEdgeStyle;rounded=0;",
+            'edge': '1',
+            'parent': '1',
+            'source': src,
+            'target': dst
+        })
+        ET.SubElement(edge_cell, 'mxGeometry', attrib={
+            'relative': '1'
+        }).set('as', 'geometry')
+
+    return mxfile
+
+def main():
+    if len(sys.argv) < 3:
+        print("用法: python mermaid_to_drawio.py <input.mermaid> <output.drawio>")
+        sys.exit(1)
+
+    input_path = sys.argv[1]
+    output_path = sys.argv[2]
+
+    direction, nodes, edges = parse_mermaid(input_path)
+    mxfile = generate_drawio_xml(direction, nodes, edges)
+
+    tree = ET.ElementTree(mxfile)
+    tree.write(output_path, encoding='utf-8', xml_declaration=True)
+    print(f"轉換完成，已產生 {output_path}")
+
+if __name__ == "__main__":
+    main()
